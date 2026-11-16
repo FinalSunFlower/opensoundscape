@@ -10,6 +10,7 @@ from . import export
 from . import lightning
 from . import onnx_model
 from . import shallow_classifier
+from opensoundscape.logging import BaseLogger
 import torch.multiprocessing
 
 # using 'file_system' avoids errors with "Too many open files",

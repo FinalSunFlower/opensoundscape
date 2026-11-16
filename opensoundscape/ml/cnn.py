@@ -37,7 +37,7 @@ from opensoundscape.preprocess.preprocessors import (
 from opensoundscape.preprocess import io
 from opensoundscape.ml.datasets import AudioFileDataset
 from opensoundscape.ml.dataloaders import collate_audio_samples
-from opensoundscape.logging import wandb_table
+from opensoundscape.logging import logger_lifecycle, wandb_table
 from opensoundscape.ml import shallow_classifier
 from opensoundscape.ml.cam import CAM
 import torch
@@ -50,7 +50,6 @@ from torchmetrics.classification import (
 from tqdm.autonotebook import tqdm
 
 import opensoundscape
-from opensoundscape.logging import wandb_table
 from opensoundscape.ml import cnn_architectures, shallow_classifier
 from opensoundscape.ml.base_model import BaseModule
 from opensoundscape.ml.cam import CAM
@@ -755,6 +754,7 @@ class SpectrogramClassifier(SpectrogramModule):
         if self.verbose >= level:
             print(txt)
 
+    @logger_lifecycle("predict")
     def predict(
         self,
         samples,
@@ -773,6 +773,7 @@ class SpectrogramClassifier(SpectrogramModule):
         progress_bar=True,
         audio_root=None,
         output_size_warning=1e9,
+        logger=None,
         **dataloader_kwargs,
     ):
         """Generate predictions on a set of samples
@@ -811,10 +812,8 @@ class SpectrogramClassifier(SpectrogramModule):
             raise_errors:
                 if True, raise errors when preprocessing fails
                 if False, just log the errors to unsafe_samples_log
-            wandb_session: a wandb session to log to
-                - pass the value returned by wandb.init() to progress log to a
-                Weights and Biases run
-                - if None, does not log to wandb
+            logger: a BaseLogger or object with a callable .log() method
+            wandb_session: deprecated alias for logger
             return_invalid_samples: bool, if True, returns second argument, a set
                 containing file paths of samples that caused errors during preprocessing
                 [default: False]
@@ -834,13 +833,8 @@ class SpectrogramClassifier(SpectrogramModule):
             where invalid_samples is a set of file paths that failed to preprocess
 
         Effects:
-            (1) wandb logging
-            If wandb_session is provided, logs progress and samples to Weights
-            and Biases. A random set of samples is preprocessed and logged to
-            a table. Progress over all batches is logged. Afte prediction,
-            top scoring samples are logged.
-            Use self.wandb_logging dictionary to change the number of samples
-            logged or which classes have top-scoring samples logged.
+            If logger is a W&B run, logs preview samples, batch progress, and
+            top-scoring samples. Other loggers receive batch progress metrics.
 
             (2) unsafe sample logging
             If unsafe_samples_log is not None, saves a list of all file paths that
@@ -873,13 +867,9 @@ class SpectrogramClassifier(SpectrogramModule):
         # check size of output
         _warn_output_size(dataloader, len(self.classes), output_size_warning)
 
-        # Initialize Weights and Biases (wandb) logging
-        if wandb_session is not None:
-            # update the run config with information about the model
-            wandb_session.config.update(self._generate_wandb_config())
-
+        if logger.is_wandb:
             # update the run config with prediction parameters
-            wandb_session.config.update(
+            logger.update_config(
                 dict(
                     batch_size=batch_size,
                     num_workers=num_workers,
@@ -888,7 +878,7 @@ class SpectrogramClassifier(SpectrogramModule):
             )
 
             # Log a table of preprocessed samples to wandb
-            wandb_session.log(
+            logger.log(
                 {
                     "Peprocessed_samples": wandb_table(
                         dataloader.dataset.dataset,
@@ -901,7 +891,7 @@ class SpectrogramClassifier(SpectrogramModule):
         # iterate dataloader and run inference (forward pass) to generate scores
         pred_scores = self(
             dataloader=dataloader,
-            wandb_session=wandb_session,
+            logger=logger,
             progress_bar=progress_bar,
             targets=(self.class_outputs_key,),
         )[self.class_outputs_key]
@@ -918,7 +908,7 @@ class SpectrogramClassifier(SpectrogramModule):
         invalid_samples = dataloader.dataset.report(log=invalid_samples_log)
 
         # log top-scoring samples per class to wandb table
-        if wandb_session is not None:
+        if logger.is_wandb:
             classes_to_log = self.wandb_logging["top_samples_classes"]
             if classes_to_log is None:  # pick the first few classes if none specified
                 classes_to_log = self.classes
@@ -941,7 +931,7 @@ class SpectrogramClassifier(SpectrogramModule):
                     drop_labels=True,
                     gradcam_model=self if self.wandb_logging["gradcam"] else None,
                 )
-                wandb_session.log({f"Top_scoring_{c.replace(' ','_')}": table})
+                logger.log({f"Top_scoring_{c.replace(' ','_')}": table})
 
         if return_invalid_samples:
             return score_df, invalid_samples
@@ -1192,6 +1182,7 @@ class SpectrogramClassifier(SpectrogramModule):
 
         return wandb_config
 
+    @logger_lifecycle("train")
     def train(
         self,
         train_df,
@@ -1211,6 +1202,7 @@ class SpectrogramClassifier(SpectrogramModule):
         progress_bar=True,
         audio_root=None,
         reload_best_at_end=True,
+        logger=None,
         **dataloader_kwargs,
     ):
         """train the model on samples from train_dataset
@@ -1260,19 +1252,8 @@ class SpectrogramClassifier(SpectrogramModule):
             raise_errors:
                 if True, raise errors when preprocessing fails
                 if False, just log the errors to unsafe_samples_log
-            wandb_session: a wandb session to log to
-                - pass the value returned by wandb.init() to progress log to a
-                Weights and Biases run
-                - if None, does not log to wandb
-                For example:
-                ```
-                import wandb
-                wandb.login(key=api_key) #find your api_key at https://wandb.ai/settings
-                session = wandb.init(enitity='mygroup',project='project1',name='first_run')
-                ...
-                model.train(...,wandb_session=session)
-                session.finish()
-                ```
+            logger: a BaseLogger or object with a callable .log() method
+            wandb_session: deprecated alias for logger
             audio_root: optionally pass a root directory (pathlib.Path or str)
                 - `audio_root` is prepended to each file path
                 - if None (default), samples must contain full paths to files
@@ -1282,12 +1263,8 @@ class SpectrogramClassifier(SpectrogramModule):
                 Best model is determined by validation set's self.score_metric score
             **dataloader_kwargs: additional arguments passed to train_dataloader()
         Effects:
-            If wandb_session is provided, logs progress and samples to Weights
-            and Biases. A random set of training and validation samples
-            are preprocessed and logged to a table. Training progress, loss,
-            and metrics are also logged.
-            Use self.wandb_logging dictionary to change the number of samples
-            logged.
+            If logger is a W&B run, logs preview samples and training metrics.
+            Other loggers receive training and validation metrics.
         """
 
         ### Input Validation ###
@@ -1313,13 +1290,9 @@ class SpectrogramClassifier(SpectrogramModule):
         self.save_interval = save_interval
         self.save_path = save_path
 
-        # Initialize Weights and Biases (wandb) logging ###
-        if wandb_session is not None:
-            # update the run config with information about the model
-            wandb_session.config.update(self._generate_wandb_config())
-
+        if logger.is_wandb:
             # update the run config with training parameters
-            wandb_session.config.update(
+            logger.update_config(
                 dict(
                     steps=steps,
                     batch_size=batch_size,
@@ -1330,19 +1303,8 @@ class SpectrogramClassifier(SpectrogramModule):
                 )
             )
 
-            # use wandb.watch to log histograms of parameter and gradient values
-            # value of None for log_freq means do not use wandb.watch()
-            log_freq = self.wandb_logging["watch_freq"]
-            if log_freq is not None:
-                wandb_session.watch(
-                    self.network,
-                    log="all",
-                    log_freq=log_freq,
-                    log_graph=(self.wandb_logging["log_graph"]),
-                )
-
             # log tables of preprocessed samples
-            wandb_session.log(
+            logger.log(
                 {
                     "training_samples": wandb_table(
                         AudioFileDataset(
@@ -1359,7 +1321,7 @@ class SpectrogramClassifier(SpectrogramModule):
                 }
             )
             if validation_df is not None:
-                wandb_session.log(
+                logger.log(
                     {
                         "validation_samples": wandb_table(
                             AudioFileDataset(
@@ -1442,12 +1404,12 @@ class SpectrogramClassifier(SpectrogramModule):
                 # compute and reset TorchMetrics for training set
                 self.train_metrics[self.current_step] = self.eval()
 
-                if wandb_session is not None:
-                    wandb_session.log({"loss": loss.item()})
-                    wandb_session.log(
-                        {"training": self.train_metrics[self.current_step]}
-                    )
-                    wandb_session.log({"step": self.current_step})
+                logger.log({"loss": loss.item()}, step=self.current_step)
+                logger.log(
+                    {"training": self.train_metrics[self.current_step]},
+                    step=self.current_step,
+                )
+                logger.log({"step": self.current_step}, step=self.current_step)
 
             #### Validation ###
             if step % validation_interval == 0:
@@ -1463,8 +1425,7 @@ class SpectrogramClassifier(SpectrogramModule):
                     )
                     self.valid_metrics[self.current_step] = val_metrics
                     score = val_metrics[self.score_metric]  # overall score
-                    if wandb_session is not None:
-                        wandb_session.log({"validation": val_metrics})
+                    logger.log({"validation": val_metrics}, step=self.current_step)
                 else:
                     # Get overall score from training metrics if no validation_df given
                     score = self.train_metrics[self.current_step][self.score_metric]
@@ -1590,7 +1551,7 @@ class SpectrogramClassifier(SpectrogramModule):
 
         Args:
             path: file path for saved model object
-            save_hooks: retain forward and backward hooks on modules
+            save_hooks: retain forward and backward hooks on modules and parameters
                 [default: False] Note: True can cause issues when using
                 wandb.watch()
             pickle: if True, saves the entire model object using torch.save()
@@ -1608,15 +1569,47 @@ class SpectrogramClassifier(SpectrogramModule):
         """
         os.makedirs(Path(path).parent, exist_ok=True)
 
-        model_copy = copy.deepcopy(self)
-
         if not save_hooks:
-            # remove all forward and backward hooks on network.modules()
             from collections import OrderedDict
 
+            hook_attributes = (
+                "_forward_hooks",
+                "_forward_pre_hooks",
+                "_backward_hooks",
+                "_backward_pre_hooks",
+                "_forward_hooks_with_kwargs",
+                "_forward_pre_hooks_with_kwargs",
+                "_forward_hooks_always_called",
+            )
+            hook_mappings = []
+            for m in self.network.modules():
+                for attribute in hook_attributes:
+                    hooks = getattr(m, attribute, None)
+                    if isinstance(hooks, dict):
+                        hook_mappings.append((m, attribute, hooks))
+                        setattr(m, attribute, OrderedDict())
+                for parameter in m.parameters(recurse=False):
+                    hooks = getattr(parameter, "_backward_hooks", None)
+                    if isinstance(hooks, dict):
+                        hook_mappings.append((parameter, "_backward_hooks", hooks))
+                        parameter._backward_hooks = OrderedDict()
+
+            try:
+                model_copy = copy.deepcopy(self)
+            finally:
+                for owner, attribute, hooks in hook_mappings:
+                    setattr(owner, attribute, hooks)
+
             for m in model_copy.network.modules():
-                m._forward_hooks = OrderedDict()
-                m._backward_hooks = OrderedDict()
+                for attribute in hook_attributes:
+                    hooks = getattr(m, attribute, None)
+                    if isinstance(hooks, dict):
+                        setattr(m, attribute, OrderedDict())
+                for parameter in m.parameters(recurse=False):
+                    if isinstance(parameter._backward_hooks, dict):
+                        parameter._backward_hooks = OrderedDict()
+        else:
+            model_copy = copy.deepcopy(self)
 
         if pickle:
             # save a pickled model object; may not work across environments / opso versions
@@ -1648,8 +1641,7 @@ class SpectrogramClassifier(SpectrogramModule):
                 or self.network.constructor_name
                 not in cnn_architectures.ARCH_DICT.keys()
             ):
-                warnings.warn(
-                    """
+                warnings.warn("""
                     This architecture is not listed in opensoundscape.ml.cnn_architectures.ARCH_DICT.
                     It will not be available for loading after saving the model with .save() (unless using pickle=True). 
                     To make it re-loadable, define a function that generates the architecture from arguments: (n_classes, n_channels) 
@@ -1659,8 +1651,7 @@ class SpectrogramClassifier(SpectrogramModule):
                     to avoid this warning and ensure it is reloaded correctly by opensoundscape.CNN.load().
 
                     See opensoundscape.ml.cnn_architectures module for examples of constructor functions
-                    """
-                )
+                    """)
 
             # save dictionary of separate components
             # better for cross-version compatability
@@ -1739,6 +1730,7 @@ class SpectrogramClassifier(SpectrogramModule):
             torch.load(path, map_location=self.device), strict=strict
         )
 
+    @logger_lifecycle("predict")
     def __call__(
         self,
         dataloader,
@@ -1746,6 +1738,7 @@ class SpectrogramClassifier(SpectrogramModule):
         progress_bar=True,
         targets=None,
         avgpool_intermediates=True,
+        logger=None,
     ):
         """Run inference on a dataloader, generating scores for each sample
 
@@ -1756,7 +1749,8 @@ class SpectrogramClassifier(SpectrogramModule):
         Args:
             dataloader: DataLoader object to create samples, e.g. from .predict_dataloader()
                 Note: expects list of AudioSample objects, not (tensors, labels)
-            wandb_session: a wandb session to log progress to (e.g. return value of wandb.init())
+            logger: a BaseLogger or object with a callable .log() method
+            wandb_session: deprecated alias for logger
             progress_bar: bool, if True, shows a progress bar with tqdm [default: True]
             targets: list of layers to return outputs from. Default [None] will return final outputs
                 with key self.class_outputs_key
@@ -1806,14 +1800,14 @@ class SpectrogramClassifier(SpectrogramModule):
                 # first dimension of v corresponds to batch dimension, all others to output shape
                 v[invalid_sample_mask, ...] = np.nan
                 outs[k].append(v)  # store outputs for this batch
-            if wandb_session is not None:
-                wandb_session.log(
-                    {
-                        "progress": i / len(dataloader),
-                        "completed_batches": i,
-                        "total_batches": len(dataloader),
-                    }
-                )
+            logger.log(
+                {
+                    "progress": i / len(dataloader),
+                    "completed_batches": i,
+                    "total_batches": len(dataloader),
+                },
+                step=i,
+            )
 
         # aggregate across all batches
         if len(list(outs.values())[0]) > 0:
@@ -1821,6 +1815,7 @@ class SpectrogramClassifier(SpectrogramModule):
                 outs[k] = np.vstack(outs[k])
         return outs
 
+    @logger_lifecycle("predict")
     def embed_to_hoplite_db(
         self,
         samples,
@@ -1837,6 +1832,7 @@ class SpectrogramClassifier(SpectrogramModule):
         overflow_mode="warn",
         embedding_dim=None,
         strict_matching=False,
+        logger=None,
         **dataloader_kwargs,
     ):
         """Run inference on a dataloader, saving 1D outputs of target_layer to a hoplite database
@@ -1867,7 +1863,8 @@ class SpectrogramClassifier(SpectrogramModule):
                 have a default target layer. See pytorch_grad_cam docs for suggestions.
                 Note: if multiple layers are provided, the activations are merged across
                     layers (rather than returning separate activations per layer)
-            wandb_session: a wandb session to log progress to (e.g. return value of wandb.init())
+            logger: a BaseLogger or object with a callable .log() method
+            wandb_session: deprecated alias for logger
             progress_bar: bool, if True, shows a progress bar with tqdm [default: True]
             audio_root: the root directory for relative paths to audio files
             embedding_exists_mode: str, behavior when an embedding already exists for a given
@@ -2037,14 +2034,14 @@ class SpectrogramClassifier(SpectrogramModule):
             # committing is relatively slow, but we don't want to lose progress if interrupted
             if (i + 1) % commit_frequency_batches == 0:
                 db.commit()
-            if wandb_session is not None:
-                wandb_session.log(
-                    {
-                        "progress": i / len(dataloader),
-                        "completed_batches": i,
-                        "total_batches": len(dataloader),
-                    }
-                )
+            logger.log(
+                {
+                    "progress": i / len(dataloader),
+                    "completed_batches": i,
+                    "total_batches": len(dataloader),
+                },
+                step=i,
+            )
         # end of batch loop
 
         # commit any remaining uncommited db entries!

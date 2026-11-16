@@ -28,6 +28,7 @@ from .sample_data import birds, birds_path
 from .spectrogram import Spectrogram, MelSpectrogram
 from .ml.song_space import SongSpace
 from .ml.cnn import SpectrogramClassifier, CNN, load_model
+from .logging import BaseLogger
 from .ml.onnx_model import ONNXModel
 from .ml.lightning import LightningSpectrogramModule
 from .ml.datasets import AudioFileDataset

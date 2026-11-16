@@ -29,8 +29,24 @@ from opensoundscape.ml.shallow_classifier import MLPClassifier
 
 from opensoundscape.sample import AudioSample
 from opensoundscape.ml.cam import CAM
+from opensoundscape.logging import BaseLogger
 
 from opensoundscape.utils import make_clip_df, identity
+
+
+class _RecordingLogger(BaseLogger):
+    def __init__(self):
+        self.events = []
+        self.metrics = []
+
+    def setup(self, model=None, stage=None, **kwargs):
+        self.events.append(("setup", stage))
+
+    def log(self, metrics, step=None, **kwargs):
+        self.metrics.append((metrics, step))
+
+    def finish(self, model=None, stage=None, **kwargs):
+        self.events.append(("finish", stage))
 
 
 @pytest.fixture()
@@ -273,6 +289,222 @@ def test_train_wandb(train_df, temp_model_dir):
 
     if os.path.exists("wandb"):
         shutil.rmtree("wandb")
+
+
+def test_base_logger_lifecycle_for_train_and_predict(train_df, temp_model_dir):
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    logger = _RecordingLogger()
+
+    model.train(
+        train_df,
+        train_df,
+        save_path=temp_model_dir,
+        steps=1,
+        batch_size=2,
+        num_workers=0,
+        progress_bar=False,
+        invalid_samples_log=None,
+        logger=logger,
+    )
+
+    assert logger.events == [("setup", "train"), ("finish", "train")]
+    assert any("loss" in metrics and step == 0 for metrics, step in logger.metrics)
+
+    logger.events.clear()
+    model.predict(
+        train_df,
+        batch_size=2,
+        num_workers=0,
+        progress_bar=False,
+        invalid_samples_log=None,
+        logger=logger,
+    )
+
+    assert logger.events == [("setup", "predict"), ("finish", "predict")]
+    assert any("progress" in metrics and step == 0 for metrics, step in logger.metrics)
+
+
+def test_logger_finish_when_train_raises(train_df):
+    class FailingLogger(_RecordingLogger):
+        def log(self, metrics, step=None, **kwargs):
+            if "loss" in metrics:
+                raise RuntimeError("training log failed")
+            super().log(metrics, step=step, **kwargs)
+
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    logger = FailingLogger()
+
+    with pytest.raises(RuntimeError, match="training log failed"):
+        model.train(
+            train_df,
+            train_df,
+            steps=1,
+            batch_size=2,
+            num_workers=0,
+            progress_bar=False,
+            invalid_samples_log=None,
+            logger=logger,
+        )
+
+    assert logger.events == [("setup", "train"), ("finish", "train")]
+
+
+def test_logger_finish_when_predict_raises(train_df, monkeypatch):
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    logger = _RecordingLogger()
+
+    def raise_error(*args, **kwargs):
+        raise RuntimeError("prediction failed")
+
+    monkeypatch.setattr(cnn, "_check_classes_inference", raise_error)
+    with pytest.raises(RuntimeError, match="prediction failed"):
+        model.predict(train_df, logger=logger, progress_bar=False)
+
+    assert logger.events == [("setup", "predict"), ("finish", "predict")]
+
+
+def test_duck_typed_logger_and_logger_validation(train_df):
+    class DuckLogger:
+        def __init__(self):
+            self.metrics = []
+
+        def log(self, metrics):
+            self.metrics.append(metrics)
+
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    logger = DuckLogger()
+    model.predict(
+        train_df,
+        batch_size=2,
+        num_workers=0,
+        progress_bar=False,
+        invalid_samples_log=None,
+        logger=logger,
+    )
+
+    assert any(
+        "progress" in metrics and "step" in metrics for metrics in logger.metrics
+    )
+    with pytest.raises(TypeError, match=r"callable \.log\(\)"):
+        model.predict([], logger=object())
+    with pytest.raises(ValueError, match="either logger or wandb_session"):
+        model.predict([], logger=logger, wandb_session=logger)
+
+
+def test_deprecated_wandb_session_alias(train_df):
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    logger = _RecordingLogger()
+    invalid_df = train_df.rename(columns={0: "wrong", 1: "labels"})
+
+    with pytest.warns(DeprecationWarning, match="wandb_session is deprecated"):
+        with pytest.raises(AssertionError):
+            model.train(invalid_df, wandb_session=logger, progress_bar=False)
+
+    assert logger.events == [("setup", "train"), ("finish", "train")]
+
+
+def test_wandb_watch_hooks_are_removed_after_training(
+    train_df, temp_model_dir, monkeypatch
+):
+    class Config:
+        def __init__(self):
+            self.values = []
+
+        def update(self, values):
+            self.values.append(values)
+
+    class Run:
+        def __init__(self):
+            self.config = Config()
+            self.metrics = []
+            self.watched = []
+            self.unwatched = []
+            self.fail_on_loss = False
+
+        def log(self, metrics, **kwargs):
+            if self.fail_on_loss and "loss" in metrics:
+                raise RuntimeError("training log failed")
+            self.metrics.append((metrics, kwargs))
+
+        def watch(self, model, **kwargs):
+            self.watched.append((model, kwargs))
+            model.register_forward_hook(lambda module, inputs, output: None)
+            next(model.parameters()).register_hook(lambda gradient: gradient)
+
+        def unwatch(self, model):
+            self.unwatched.append(model)
+
+    monkeypatch.setattr(cnn, "wandb_table", lambda *args, **kwargs: "table")
+    model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    run = Run()
+    preexisting_hook = model.network.register_forward_hook(
+        lambda module, inputs, output: None
+    )
+
+    model.train(
+        train_df,
+        train_df,
+        save_path=temp_model_dir,
+        steps=1,
+        batch_size=2,
+        num_workers=0,
+        progress_bar=False,
+        invalid_samples_log=None,
+        logger=run,
+    )
+
+    assert run.watched and run.unwatched == [model.network]
+    assert run.metrics
+    assert all(
+        set(module._forward_hooks)
+        == ({preexisting_hook.id} if module is model.network else set())
+        for module in model.network.modules()
+    )
+    assert all(
+        not parameter._backward_hooks
+        for module in model.network.modules()
+        for parameter in module.parameters(recurse=False)
+    )
+    assert (temp_model_dir / "best.pickle").exists()
+
+    model.save(temp_model_dir / "after_training.pickle", pickle=True)
+
+    failed_model = cnn.CNN(
+        architecture="resnet18", classes=[0, 1], sample_duration=5.0, sample_rate=22050
+    )
+    failed_run = Run()
+    failed_run.fail_on_loss = True
+    with pytest.raises(RuntimeError, match="training log failed"):
+        failed_model.train(
+            train_df,
+            train_df,
+            steps=1,
+            batch_size=2,
+            num_workers=0,
+            progress_bar=False,
+            invalid_samples_log=None,
+            logger=failed_run,
+        )
+
+    assert failed_run.watched and failed_run.unwatched == [failed_model.network]
+    assert all(not module._forward_hooks for module in failed_model.network.modules())
+    assert all(
+        not parameter._backward_hooks
+        for module in failed_model.network.modules()
+        for parameter in module.parameters(recurse=False)
+    )
 
 
 onnx_deps = pytest.mark.skipif(
@@ -1414,7 +1646,7 @@ def test_generate_cams_missing_grad_cam_error(monkeypatch, test_df):
     )
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
-    with pytest.raises(ImportError, match="opensoundscape\[grad-cam\]"):
+    with pytest.raises(ImportError, match=r"opensoundscape\[grad-cam\]"):
         model.generate_cams(test_df)
 
 

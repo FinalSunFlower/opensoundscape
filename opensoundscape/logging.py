@@ -1,11 +1,254 @@
-"""helpers for integrating with WandB and exporting content"""
+"""Logging interfaces and helpers for exporting content."""
 
+import inspect
+from abc import ABC, abstractmethod
+from functools import wraps
+from typing import Any
 import warnings
 
-import wandb
 import pandas as pd
 from opensoundscape.audio import Audio
 from opensoundscape.spectrogram import Spectrogram
+
+
+class BaseLogger(ABC):
+    """Base class for logging metrics from OpenSoundscape models."""
+
+    def setup(self, model=None, stage=None, **kwargs) -> None:
+        """Prepare the logger for a model operation."""
+
+    @abstractmethod
+    def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
+        """Log a mapping of metric names to values."""
+
+    def finish(self, model=None, stage=None, **kwargs) -> None:
+        """Finish a model operation."""
+
+
+def _is_wandb_session(logger):
+    config = getattr(logger, "config", None)
+    return (
+        callable(getattr(logger, "log", None))
+        and callable(getattr(logger, "watch", None))
+        and callable(getattr(config, "update", None))
+    )
+
+
+def _module_hook_mappings(model):
+    if model is None or not hasattr(model, "network"):
+        return []
+
+    hook_attributes = (
+        "_forward_hooks",
+        "_forward_pre_hooks",
+        "_backward_hooks",
+        "_backward_pre_hooks",
+        "_forward_hooks_with_kwargs",
+        "_forward_pre_hooks_with_kwargs",
+        "_forward_hooks_always_called",
+    )
+    mappings = []
+    for module in model.network.modules():
+        for attribute in hook_attributes:
+            hooks = getattr(module, attribute, None)
+            if isinstance(hooks, dict):
+                mappings.append((module, attribute, set(hooks)))
+        for parameter in module.parameters(recurse=False):
+            hooks = getattr(parameter, "_backward_hooks", None)
+            mappings.append(
+                (
+                    parameter,
+                    "_backward_hooks",
+                    set(hooks) if isinstance(hooks, dict) else set(),
+                )
+            )
+    return mappings
+
+
+def _new_hook_mappings(model, previous_mappings):
+    previous = {
+        (id(owner), attribute): hook_ids
+        for owner, attribute, hook_ids in previous_mappings
+    }
+    return [
+        (
+            owner,
+            attribute,
+            hook_ids.difference(previous.get((id(owner), attribute), set())),
+        )
+        for owner, attribute, hook_ids in _module_hook_mappings(model)
+        if hook_ids.difference(previous.get((id(owner), attribute), set()))
+    ]
+
+
+class _LoggerAdapter:
+    def __init__(self, logger):
+        self.logger = logger
+        self.is_wandb = _is_wandb_session(logger)
+        self._depth = 0
+        self._model = None
+        self._stage = None
+        self._hook_mappings = []
+        self._watch_requested = False
+
+    def setup(self, model=None, stage=None):
+        if self._depth:
+            self._depth += 1
+            return
+
+        self._depth = 1
+        self._model = model
+        self._stage = stage
+        if self.is_wandb:
+            if hasattr(model, "_generate_wandb_config"):
+                self.update_config(model._generate_wandb_config())
+            if stage == "train" and hasattr(model, "wandb_logging"):
+                log_freq = model.wandb_logging["watch_freq"]
+                if log_freq is not None:
+                    previous_mappings = _module_hook_mappings(model)
+                    self._watch_requested = True
+                    try:
+                        self.logger.watch(
+                            model.network,
+                            log="all",
+                            log_freq=log_freq,
+                            log_graph=model.wandb_logging["log_graph"],
+                        )
+                    finally:
+                        self._hook_mappings = _new_hook_mappings(
+                            model, previous_mappings
+                        )
+        elif isinstance(self.logger, BaseLogger):
+            self.logger.setup(model=model, stage=stage)
+
+    def update_config(self, values):
+        if self.is_wandb:
+            self.logger.config.update(values)
+
+    def log(self, metrics, step=None, **kwargs):
+        if self.logger is None:
+            return
+
+        method = self.logger.log
+        if self.is_wandb:
+            method(metrics, **kwargs)
+            return
+
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            accepts_step = any(
+                parameter.name == "step"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_step = False
+
+        if accepts_step:
+            method(metrics, step=step, **kwargs)
+        else:
+            payload = metrics if step is None else {**metrics, "step": step}
+            method(payload)
+
+    def _unwatch(self):
+        if not self._watch_requested:
+            return
+
+        try:
+            unwatch = getattr(self.logger, "unwatch", None)
+            if callable(unwatch):
+                try:
+                    parameters = inspect.signature(unwatch).parameters.values()
+                    accepts_model = any(
+                        parameter.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.VAR_POSITIONAL,
+                        )
+                        for parameter in parameters
+                    )
+                except (TypeError, ValueError):
+                    accepts_model = True
+                if accepts_model:
+                    unwatch(self._model.network)
+                else:
+                    unwatch()
+        finally:
+            for owner, attribute, hook_ids in self._hook_mappings:
+                hooks = getattr(owner, attribute, None)
+                if isinstance(hooks, dict):
+                    for hook_id in hook_ids:
+                        hooks.pop(hook_id, None)
+
+    def finish(self, model=None, stage=None):
+        if self._depth == 0:
+            return
+
+        self._depth -= 1
+        if self._depth:
+            return
+
+        model = self._model if model is None else model
+        stage = self._stage if stage is None else stage
+        try:
+            if self.is_wandb:
+                self._unwatch()
+            elif isinstance(self.logger, BaseLogger):
+                self.logger.finish(model=model, stage=stage)
+        finally:
+            self._hook_mappings = []
+            self._watch_requested = False
+            self._model = None
+            self._stage = None
+
+
+def _resolve_logger(logger=None, wandb_session=None):
+    if logger is not None and wandb_session is not None:
+        raise ValueError("Pass either logger or wandb_session, not both")
+
+    if wandb_session is not None:
+        warnings.warn(
+            "wandb_session is deprecated; pass it as logger instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        logger = wandb_session
+
+    if isinstance(logger, _LoggerAdapter):
+        return logger
+    if logger is not None and not callable(getattr(logger, "log", None)):
+        raise TypeError("logger must be None or provide a callable .log() method")
+    return _LoggerAdapter(logger)
+
+
+def logger_lifecycle(stage):
+    """Wrap a model operation in logger setup and cleanup."""
+
+    def decorate(method):
+        signature = inspect.signature(method)
+
+        @wraps(method)
+        def wrapped(self, *args, **kwargs):
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            adapter = _resolve_logger(
+                bound.arguments.get("logger"),
+                bound.arguments.get("wandb_session"),
+            )
+            bound.arguments["logger"] = adapter
+            if "wandb_session" in bound.arguments:
+                bound.arguments["wandb_session"] = None
+
+            try:
+                adapter.setup(model=self, stage=stage)
+                return method(*bound.args, **bound.kwargs)
+            finally:
+                adapter.finish(model=self, stage=stage)
+
+        return wrapped
+
+    return decorate
 
 
 def wandb_table(
@@ -33,6 +276,8 @@ def wandb_table(
     Returns: a W&B Table of preprocessed samples with labels and playable audio
 
     """
+    import wandb
+
     # select which clips to generate
     if n is None or len(dataset) < n:
         # if not enough samples to make n, just use all of them (don't complain)
